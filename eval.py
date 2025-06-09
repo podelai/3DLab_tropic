@@ -1,309 +1,307 @@
-
 import os
 from PIL import Image
 import numpy as np
+import skimage.transform
 from scipy.ndimage import distance_transform_edt
-
+import torch
+import matplotlib.pyplot as plt
+from matplotlib.widgets import Slider
 
 from train import train_execution_process
-
-
 from apply import apply_model_to_stack_tiled_slice_by_slice
 
 
-def import_binary_tiff_sequence(directory_path: str) -> np.ndarray | None:
+def import_binary_tiff_sequence(directory_path: str):
     """
-    Imports a sequence of binary TIFF images from a directory into a 3D numpy array.
+    Imports a sequence of binary TIFF images from a directory into a single,
+    memory-pre-allocated 3D numpy array.
 
     Args:
         directory_path (str): The path to the directory containing the TIFF images.
 
     Returns:
-        np.ndarray | None: A 3D boolean numpy array representing the image stack
-                          (depth, height, width) if successful, otherwise None.
+        Optional[np.ndarray]: A 3D boolean numpy array (depth, height, width)
+                              if successful, otherwise None.
     """
-    images = []
     try:
-        # Filter for TIFF files and sort them to maintain sequence order
         file_names = sorted([f for f in os.listdir(directory_path) if f.lower().endswith(('.tif', '.tiff'))])
     except FileNotFoundError:
         print(f"Error: Directory not found at {directory_path}")
         return None
-    except OSError as e:
-        print(f"Error accessing directory: {directory_path}. Error: {e}")
-        return None
 
     if not file_names:
-        print(f"Warning: No TIFF images found in {directory_path}. Please ensure files end with .tif or .tiff")
-        return None
-
-    for file_name in file_names:
-        full_path = os.path.join(directory_path, file_name)
-        try:
-            # Use 'with' statement for proper resource management (ensures image is closed)
-            with Image.open(full_path) as img:
-                img_array = np.array(img)
-
-                # Assuming binary is 0 or 255. Convert to boolean (True for foreground/255, False for background/0).
-                # This makes the array truly binary (True/False) which is often more memory efficient and clear.
-                img_array_binary = (img_array == 255)
-
-                # Optional: Add a check for image mode if strict binary input is required
-                # if img.mode != '1' and img.mode != 'L': # '1' for 1-bit binary, 'L' for 8-bit grayscale
-                #     print(f"Warning: Image {file_name} is not a typical binary or grayscale image. "
-                #           "Proceeding with 255 thresholding.")
-
-                images.append(img_array_binary)
-        except (IOError, OSError) as e:
-            print(f"Error: Could not open or process TIFF image: {full_path}. Error: {e}")
-            # Continue to the next file if one fails
-            continue
-        except Exception as e:
-            print(f"An unexpected error occurred while processing {full_path}: {e}")
-            # Continue to the next file
-            continue
-
-    if not images:
-        print(f"Error: No valid binary TIFF images were successfully loaded from {directory_path}")
+        print(f"Warning: No TIFF images found in {directory_path}.")
         return None
 
     try:
-        # Stack images along a new depth dimension. The result will be (num_images, height, width).
-        image_stack = np.stack(images)
-        return image_stack.astype(bool) # Ensure the final stack is boolean
-    except ValueError as e:
-        print(f"Error: Could not stack images. They might have inconsistent dimensions. Error: {e}")
+        with Image.open(os.path.join(directory_path, file_names[0])) as first_img:
+            height, width = np.array(first_img).shape
+
+        num_images = len(file_names)
+        print(f"Found {num_images} images. Allocating stack of shape ({num_images}, {height}, {width}).")
+        image_stack = np.empty((num_images, height, width), dtype=bool)
+
+        for i, file_name in enumerate(file_names):
+            full_path = os.path.join(directory_path, file_name)
+            with Image.open(full_path) as img:
+                img_array = np.array(img)
+                image_stack[i] = (img_array == 255)
+
+    except (IOError, OSError) as e:
+        print(f"Error: Could not process TIFF image: {full_path}. Error: {e}")
+        return None
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
         return None
 
-def morph_stack_interpolated(original_stack: np.ndarray, num_steps_per_slice_pair: int) -> list[np.ndarray]:
+    return image_stack
+
+
+def morph_stack_interpolated(downsampled_stack: np.ndarray, original_indices: np.ndarray, target_depth: int):
     """
-    Applies morphing between consecutive slices of a 3D image stack to create
-    a higher resolution interpolated stack. This function combines the logic
-    of iterating through slices and performing the Euclidean Distance Transform (EDT)
-    interpolation for each pair.
+    Applies morphing between consecutive slices of a downsampled 3D image stack 
+    to create a higher resolution interpolated stack of a specific target depth.
+    This version correctly handles unevenly spaced slices.
 
     Args:
-        original_stack (np.ndarray): The input 3D binary image stack (depth, height, width).
-                                     Expected to be a boolean array.
-        num_steps_per_slice_pair (int): The number of intermediate steps to generate
-                                        between each pair of original slices.
-                                        The total number of frames generated per pair
-                                        will be `num_steps_per_slice_pair + 1`.
+        downsampled_stack (np.ndarray): The input 3D binary image stack (D, H, W)
+                                        containing sparsely sampled slices.
+        original_indices (np.ndarray): A 1D array of the original depth indices
+                                       corresponding to the slices in downsampled_stack.
+        target_depth (int): The desired depth of the final interpolated stack (e.g., the depth of the raw stack).
 
     Returns:
-        list: A list of numpy arrays, representing the full interpolated 3D stack.
-              Each array is a binary image (np.uint8, 0 or 1).
+        np.ndarray: The full interpolated 3D stack as a numpy array with shape (target_depth, H, W).
     """
-    if original_stack.ndim != 3:
-        raise ValueError("Input 'original_stack' must be a 3D numpy array.")
-    if original_stack.shape[0] < 2:
-        # If there's only one slice, there's nothing to morph between.
-        # If 0 slices, it's an empty stack.
-        print("Warning: Original stack has less than 2 slices. No morphing performed.")
-        return [original_stack[0].astype(np.uint8)] if original_stack.shape[0] == 1 else []
+    if downsampled_stack.ndim != 3:
+        raise ValueError("Input 'downsampled_stack' must be a 3D numpy array.")
+    if len(downsampled_stack) != len(original_indices):
+        raise ValueError("The number of slices in downsampled_stack must match the number of original_indices.")
 
-    full_interpolated_stack = []
-    num_slices = original_stack.shape[0]
+    num_slices, height, width = downsampled_stack.shape
+    
+    if num_slices < 2:
+        print("Warning: Downsampled stack has less than 2 slices. No morphing performed.")
+        if num_slices == 1:
+            # If only one slice, tile it to fill the target depth
+            return np.repeat(downsampled_stack, target_depth, axis=0).astype(np.uint8)
+        else:
+            return np.zeros((target_depth, height, width), dtype=np.uint8)
 
+    # Pre-allocate the full output stack with the correct target depth
+    full_interpolated_stack = np.zeros((target_depth, height, width), dtype=np.uint8)
+
+    # Place the original downsampled slices into the output stack at their correct indices
+    for i, idx in enumerate(original_indices):
+        if idx < target_depth:
+            full_interpolated_stack[idx] = downsampled_stack[i].astype(np.uint8)
+
+    # Iterate through the GAPS between the downsampled slices to interpolate
     for i in range(num_slices - 1):
-        slice_start = original_stack[i]
-        slice_end = original_stack[i+1]
+        slice_start = downsampled_stack[i].astype(bool)
+        slice_end = downsampled_stack[i+1].astype(bool)
 
-        # Ensure slices are boolean for EDT calculation
-        if not np.issubdtype(slice_start.dtype, np.bool_):
-            slice_start = slice_start.astype(bool)
-        if not np.issubdtype(slice_end.dtype, np.bool_):
-            slice_end = slice_end.astype(bool)
+        # Get the start and end indices in the final stack for the current gap
+        index_start = original_indices[i]
+        index_end = original_indices[i+1]
 
-        # Calculate Signed Euclidean Distance Transform (SEDT) for both shapes.
-        # SEDT is negative inside the shape, positive outside, and zero at the boundary.
-        # distance_transform_edt expects True for foreground and False for background.
-        # To get distance from foreground (inside), use `image`.
-        # To get distance from background (outside), use `~image`.
-        # SEDT = distance_from_background - distance_from_foreground
+        # Number of new frames to generate is determined by the gap size
+        num_steps_in_gap = index_end - index_start
+        
+        if num_steps_in_gap <= 0:
+            continue
+
+        # Calculate Signed Euclidean Distance Transform (SEDT) for the start and end shapes
         edt_start = distance_transform_edt(~slice_start) - distance_transform_edt(slice_start)
         edt_end = distance_transform_edt(~slice_end) - distance_transform_edt(slice_end)
 
-        morphed_frames_for_pair = []
-        for j in range(num_steps_per_slice_pair + 1):
-            # Calculate the interpolation factor (alpha) from 0 to 1
-            alpha = j / num_steps_per_slice_pair
+        # Generate intermediate frames to fill the gap
+        for j in range(1, num_steps_in_gap):
+            # The interpolation factor `alpha` is now specific to each gap's size
+            alpha = j / num_steps_in_gap
             
-            # Linearly interpolate between the two signed distance fields
             interpolated_edt = (1 - alpha) * edt_start + alpha * edt_end
-            
-            # Threshold the interpolated EDT back to a binary image.
-            # Pixels where the interpolated EDT is less than or equal to 0 are considered part of the shape.
-            # Convert to np.uint8 (0 or 1) for consistency with image processing libraries.
             morphed_shape = (interpolated_edt <= 0).astype(np.uint8)
-            morphed_frames_for_pair.append(morphed_shape)
+            
+            output_index = index_start + j
+            if output_index < target_depth:
+                full_interpolated_stack[output_index] = morphed_shape
+
+    return full_interpolated_stack
+
+
+def view_stacks_interactively(raw_stack, morphed_stack, predicted_stack):
+    """
+    Creates an interactive viewer to compare three 3D image stacks side-by-side
+    with a slider to navigate through the slices.
+
+    Args:
+        raw_stack (np.ndarray): The ground truth stack (D, H, W).
+        morphed_stack (np.ndarray): The interpolated stack (D, H, W).
+        predicted_stack (np.ndarray): The model's prediction stack (D, H, W).
+    """
+
+    # Pad the predicted stack if its depth is smaller than the raw stack
+    depth_diff = raw_stack.shape[0] - predicted_stack.shape[0]
+    if depth_diff > 0:
+        padding = ((0, depth_diff), (0, 0), (0, 0))
+        predicted_stack = np.pad(predicted_stack, padding, mode='constant', constant_values=0)
+
+    # Ensure all stacks have the same dimensions for consistent slicing
+    if not (raw_stack.shape == morphed_stack.shape == predicted_stack.shape):
+        print("Warning: Stack shapes do not match after processing. Visualization might be inconsistent.")
+        print(f"Shapes: Raw={raw_stack.shape}, Morphed={morphed_stack.shape}, Predicted={predicted_stack.shape}")
+
+    # Binarize the prediction for clear visualization
+    predicted_stack_binary = (predicted_stack > 0.5).astype(np.uint8)
+
+    depth = raw_stack.shape[0]
+    initial_slice = depth // 2
+
+    # --- Set up the plot ---
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 6))
+    plt.subplots_adjust(bottom=0.25) # Make room for slider
+
+    im1 = ax1.imshow(raw_stack[initial_slice], cmap='gray')
+    ax1.set_title('Raw Ground Truth')
+    ax1.axis('off')
+
+    im2 = ax2.imshow(morphed_stack[initial_slice], cmap='gray')
+    ax2.set_title('Morphed Interpolation')
+    ax2.axis('off')
+
+    im3 = ax3.imshow(predicted_stack_binary[initial_slice], cmap='gray')
+    ax3.set_title('Model Prediction')
+    ax3.axis('off')
+
+    fig.suptitle(f'Slice Viewer: {initial_slice}/{depth-1}', fontsize=16)
+
+    # --- Create the slider ---
+    ax_slider = plt.axes([0.2, 0.1, 0.65, 0.03])
+    slider = Slider(
+        ax=ax_slider,
+        label='Slice Index (z)',
+        valmin=0,
+        valmax=depth - 1,
+        valinit=initial_slice,
+        valstep=1
+    )
+
+    # --- Update function for the slider ---
+    def update(val):
+        slice_idx = int(slider.val)
+        im1.set_data(raw_stack[slice_idx])
+        im2.set_data(morphed_stack[slice_idx])
+        im3.set_data(predicted_stack_binary[slice_idx])
+        fig.suptitle(f'Slice Viewer: {slice_idx}/{depth-1}')
+        fig.canvas.draw_idle()
+
+    slider.on_changed(update)
+    plt.show()
+
+
+# --- Evaluation Functions ---
+def calculate_iou(pred: np.ndarray, true: np.ndarray) -> float:
+    """Calculates Intersection over Union for binary images."""
+    # Ensure stacks have the same shape for comparison
+    if pred.shape != true.shape:
+        # Pad the smaller stack to match the larger one for IoU calculation
+        max_shape = np.maximum(pred.shape, true.shape)
         
-        # Append all morphed frames from this sequence to the full interpolated stack.
-        # We skip the first frame of subsequent sequences (i > 0) as it's a duplicate
-        # of the last frame of the previous morphing sequence.
-        if i == 0:
-            full_interpolated_stack.extend(morphed_frames_for_pair)
-        else:
-            full_interpolated_stack.extend(morphed_frames_for_pair[1:]) # Avoid duplicating the end frame of previous morph
-    
-    return np.array(full_interpolated_stack)
+        pad_pred = [(0, max_d - s) for s, max_d in zip(pred.shape, max_shape)]
+        pred = np.pad(pred, pad_pred, mode='constant', constant_values=0)
+        
+        pad_true = [(0, max_d - s) for s, max_d in zip(true.shape, max_shape)]
+        true = np.pad(true, pad_true, mode='constant', constant_values=0)
+        
+    pred_bool = (pred > 0.5)
+    true_bool = (true > 0.5)
 
+    intersection = np.logical_and(pred_bool, true_bool)
+    union = np.logical_or(pred_bool, true_bool)
 
-def export_predicted_stack_to_tiff_sequence(STACK, OUTPUT_DIRECTORY):
-    """
-    Exports a 3D numpy array (predicted stack) as a sequence of binary TIFF images.
+    if np.sum(union) == 0:
+        return 1.0
 
-    Args:
-        predicted_stack (np.ndarray): The 3D numpy array (H, W, D) containing
-                                      predicted probabilities (0-1).
-        PREDICTION_DIRECTORY (str): The path to the directory where TIFF files will be saved.
-    """
-    if not isinstance(STACK, np.ndarray) or STACK.ndim != 3:
-        print("Error: predicted_stack must be a 3D numpy array.")
-        return
+    iou = np.sum(intersection) / np.sum(union)
+    return iou
 
-    # Create the output directory if it doesn't exist
-    os.makedirs(OUTPUT_DIRECTORY, exist_ok=True)
-
-    h, w, d = STACK.shape
-
-    
-
-    # Iterate through each slice in the depth dimension
-    for k in range(d):
-        # Get the current slice (H, W)
-        slice_data = STACK[:, :, k]
-
-        # Threshold the probability mask to create a binary image (0 or 255)
-        # Values > 0.5 become 255 (white), others become 0 (black)
-        binary_slice = (slice_data > 0.5).astype(np.uint8) * 255
-
-        # Convert the numpy array slice to a PIL Image
-        img = Image.fromarray(binary_slice, mode='L') # 'L' mode for 8-bit grayscale
-
-        # Create a filename with zero-padding (e.g., slice_0000.tif)
-        file_name = f"predicted_slice_{k:04d}.tif"
-        file_path = os.path.join(OUTPUT_DIRECTORY, file_name)
-
-        try:
-            # Save the image as a TIFF file
-            img.save(file_path, format='TIFF')
-            # print(f"Saved {file_name}") # Optional: print for each file
-        except (IOError, OSError) as e:
-            print(f"Error saving TIFF image: {file_path}. Error: {e}")
-            # Continue trying to save other slices
-            continue
-        except Exception as e:
-            print(f"An unexpected error occurred while saving {file_path}: {e}")
-            # Continue trying to save other slices
-            continue
-
-    #print(f"Export finished. {d} TIFF files saved to {OUTPUT_DIRECTORY}.")
-
-def jaccard_index_binary_stacks(stack1: np.ndarray, stack2: np.ndarray) -> float:
-    """
-    Calculates the Jaccard index between two binary stacks.
-
-    Args:
-        stack1 (np.ndarray): The first binary stack (NumPy array).
-                              Should contain only 0s and 1s.
-        stack2 (np.ndarray): The second binary stack (NumPy array).
-                              Should contain only 0s and 1s.
-
-    Returns:
-        float: The Jaccard index, a value between 0.0 and 1.0.
-               Returns 1.0 if both stacks are empty (all zeros) and identical.
-               Returns 0.0 if the union is zero (i.e., both stacks are entirely empty)
-               and there's no intersection, or if one stack is empty and the other is not.
-
-    Raises:
-        ValueError: If the input stacks have different shapes or if they
-                    contain values other than 0 or 1.
-    """
-
-    if stack1.shape != stack2.shape:
-        raise ValueError("Input stacks must have the same shape.")
-
-    if not np.all(np.isin(stack1, [0, 1])):
-        raise ValueError("Stack1 must contain only binary values (0 or 1).")
-    if not np.all(np.isin(stack2, [0, 1])):
-        raise ValueError("Stack2 must contain only binary values (0 or 1).")
-
-    # Flatten the stacks to treat them as 1D arrays for easier comparison
-    flat_stack1 = stack1.flatten()
-    flat_stack2 = stack2.flatten()
-
-    # Calculate the intersection (where both are 1)
-    intersection = np.sum((flat_stack1 == 1) & (flat_stack2 == 1))
-
-    # Calculate the union (where at least one is 1)
-    union = np.sum((flat_stack1 == 1) | (flat_stack2 == 1))
-
-    if union == 0:
-        # If both stacks are entirely empty (all zeros), the Jaccard index is often
-        # considered 1.0 because they are perfectly similar.
-        # If only one stack is empty, and the other is not, union will not be 0.
-        return 1.0 if intersection == 0 else 0.0
-    else:
-        jaccard_index = intersection / union
-        return jaccard_index
 
 # --- Constants ---
 INPUT_IMAGES_DIRECTORY = "C:/Users/lucie/Desktop/3Dlab_tropic_eval/data/mito_isotrope"
-OUTPUT_PREDICTION_OUTDIRECTORY = "C:/Users/lucie/Desktop/3Dlab_tropic_eval/result/predicted_segmentation" # New output directory
+OUTPUT_PREDICTION_OUTDIRECTORY = "C:/Users/lucie/Desktop/3Dlab_tropic_eval/result/predicted_segmentation"
 OUTPUT_INTERPOLATED_DIRECTORY ="C:/Users/lucie/Desktop/3Dlab_tropic_eval/result/interpolated_segmentation"
 
-XY_RESOLUTION = 2 # Resolution in x and y
-Z_RESOLUTION = 20 # Resolution in z
+XY_RESOLUTION = 2
+Z_RESOLUTION = 20
+TRAIN_XY_SIZE = 256
+TRAIN_Z_SIZE = 5
 
-TRAIN_XY_SIZE = 256 # Size of the training dataset in x and y
-TRAIN_Z_SIZE = 1 # Size of the training dataset in z. Must be odd for centered slice label
-TRAIN_NB = 80 #Number of .. for the training dataset
+TRAIN_NB = 200
 RANDOM_STATE = 3
-
-BATCH_SIZE = 2
-NUM_EPOCHS = 80
+BATCH_SIZE = 4
+NUM_EPOCHS = 10
 LEARNING_RATE = 0.001
-
-
-
-RESOLUTION_FACTOR = int(Z_RESOLUTION / XY_RESOLUTION)
-
-
- 
 
 if __name__ == "__main__":
 
     print(f"Attempting to load binary TIFF sequence from: {INPUT_IMAGES_DIRECTORY}")
-    RAW_STACK = import_binary_tiff_sequence(INPUT_IMAGES_DIRECTORY)
-    #RAW_STACK = RAW_STACK.transpose(1,2,0)
+    RAW_STACK_DHW = import_binary_tiff_sequence(INPUT_IMAGES_DIRECTORY)
     
-    DOWNSCALED_STACK = RAW_STACK[::RESOLUTION_FACTOR]
+    if RAW_STACK_DHW is None:
+        exit("Failed to load the raw stack. Aborting.")     
     
-    # Check if TRAIN_Z_SIZE is odd
+    RESOLUTION_FACTOR = Z_RESOLUTION // XY_RESOLUTION
+    original_depth = RAW_STACK_DHW.shape[0]
+
+    # --- Corrected Downsampling ---
+    # Create indices for downsampling, ensuring the very last slice of the
+    # original stack is included so we can interpolate all the way to the end.
+    downsampled_indices = np.arange(0, original_depth, RESOLUTION_FACTOR)
+    if original_depth - 1 not in downsampled_indices:
+        downsampled_indices = np.append(downsampled_indices, original_depth - 1)
+        # Ensure indices are sorted and unique after appending
+        downsampled_indices = np.unique(np.sort(downsampled_indices))
+
+    DOWNSCALED_STACK_DHW = RAW_STACK_DHW[downsampled_indices, :, :]
+
     if TRAIN_Z_SIZE % 2 == 0:
         print("Error: TRAIN_Z_SIZE must be an odd number for the middle slice to be the label.")
         exit()
-    
+
     print("Training")
-    model = train_execution_process(DOWNSCALED_STACK.transpose(1,2,0), TRAIN_XY_SIZE, TRAIN_Z_SIZE, TRAIN_NB, RESOLUTION_FACTOR, BATCH_SIZE, LEARNING_RATE, NUM_EPOCHS, RANDOM_STATE)
+    model, history = train_execution_process(DOWNSCALED_STACK_DHW, TRAIN_XY_SIZE, TRAIN_Z_SIZE, TRAIN_NB, RESOLUTION_FACTOR, BATCH_SIZE, LEARNING_RATE, NUM_EPOCHS, RANDOM_STATE)
     
     print("Apply")
-    final_predicted_stack = apply_model_to_stack_tiled_slice_by_slice(model, DOWNSCALED_STACK, TRAIN_Z_SIZE, RESOLUTION_FACTOR, TRAIN_XY_SIZE, BATCH_SIZE)
+    # Note: the prediction is on n-1 slices
+    final_predicted_stack = apply_model_to_stack_tiled_slice_by_slice(model, DOWNSCALED_STACK_DHW[:-1,:,:], TRAIN_Z_SIZE, RESOLUTION_FACTOR, TRAIN_XY_SIZE, BATCH_SIZE)
     
-    # Call the new merged function
-    morphed_stack = morph_stack_interpolated(DOWNSCALED_STACK, RESOLUTION_FACTOR)
+    print("Morphing")
+    # --- Corrected Morphing Call ---
+    # Pass the downscaled stack (D,H,W), its original indices, and the target depth.
+    morphed_stack_dhw = morph_stack_interpolated(
+        DOWNSCALED_STACK_DHW, 
+        downsampled_indices,
+        original_depth
+    )
+
     
-    print(f"\nExporting final_predicted_stack to {OUTPUT_PREDICTION_OUTDIRECTORY}...")
-    export_predicted_stack_to_tiff_sequence(final_predicted_stack.transpose(1,2,0), OUTPUT_PREDICTION_OUTDIRECTORY)
-    
-    print(f"\nExporting morphed_stack to {OUTPUT_INTERPOLATED_DIRECTORY}...")
-    #export_predicted_stack_to_tiff_sequence(morphed_stack.transpose(1,2,0), OUTPUT_INTERPOLATED_DIRECTORY)
-    
-    jaccard_index_morphed = jaccard_index_binary_stacks(RAW_STACK[0:491], morphed_stack)
-    jaccard_index_prediction = jaccard_index_binary_stacks(RAW_STACK, (final_predicted_stack > 0.5).astype(np.uint8))
-    
+    print(f"\nRAW_STACK_DHW shape: {RAW_STACK_DHW.shape}")
+    print(f"Morphed stack shape: {morphed_stack_dhw.shape}")
+    # Note: predicted stack has shape (H, W, D)
+    print(f"Predicted stack shape: {final_predicted_stack.shape}\n")
+
+    # --- IoU Calculation ---
+    # The morphed stack should now have the same dimensions as the raw stack
+    IOU_morphed = calculate_iou(morphed_stack_dhw, RAW_STACK_DHW)
+    # Transpose prediction for IoU calculation
+    IOU_prediction = calculate_iou(final_predicted_stack, RAW_STACK_DHW)
+
+    print(f"IoU for Morphed Stack: {IOU_morphed:.4f}")
+    print(f"IoU for Predicted Stack: {IOU_prediction:.4f}")
+
+    # --- Interactive Visualization ---
+    print("\nLaunching interactive stack viewer...")
+    view_stacks_interactively(RAW_STACK_DHW, morphed_stack_dhw, final_predicted_stack)
+
     print("DONE")
-    
-
-
