@@ -1,0 +1,37 @@
+
+def downscale_image_height(image: np.ndarray, downscale_factor: int) -> np.ndarray:
+    """
+    Downscales the image height by taking every Nth row (decimation).
+
+    Args:
+        image (np.ndarray): The input 3D image stack.
+        downscale_factor (int): The factor to downscale by (e.g., 4 means 1/4 of the rows).
+
+    Returns:
+        The downscaled image stack.
+    """
+    print(f"Original image shape for downscaling: {image.shape}")
+    # This selects rows 0, N, 2N, ... from the height axis (axis 1)
+    downscaled_image = image[:, ::downscale_factor, :]
+    print(f"Downscaled image shape: {downscaled_image.shape}")
+    return downscaled_image
+
+def upscale_image_height(image: np.ndarray, upscale_factor: int) -> np.ndarray:
+    """
+    Upscales the height of a 3D image stack efficiently using nearest-neighbor interpolation.
+    This is achieved by repeating each slice along the height axis.
+
+    Args:
+        image (np.ndarray): The input 3D image stack (depth, height, width).
+        upscale_factor (int): The factor by which to upscale the height.
+
+    Returns:
+        The upscaled image stack.
+    """
+    print(f"Original image shape for upscaling: {image.shape}")
+    # np.repeat is highly optimized for this exact task.
+    # It repeats the elements of an array along a specified axis.
+    # Here, we are repeating each row (elements along axis=1) 'upscale_factor' times.
+    upscaled = image.repeat(upscale_factor, axis=1)
+    print(f"Upscaled image shape: {upscaled.shape}")
+    return upscaled
